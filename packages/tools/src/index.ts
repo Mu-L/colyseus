@@ -1,63 +1,18 @@
-import fs from "fs";
+import "./loadenv";
 import os from "os";
 import http from "http";
-import path from "path";
 import cors from "cors";
 import express from "express";
-import dotenv from "dotenv";
 import osUtils from "node-os-utils";
 import { logger, Server, ServerOptions, Transport, matchMaker } from '@colyseus/core';
 import { WebSocketTransport } from '@colyseus/ws-transport';
 
 // try to import uWebSockets-express compatibility layer.
 let uWebSocketsExpressCompatibility: any = undefined;
-try { uWebSocketsExpressCompatibility = require('uwebsockets-express').default; } catch (e) {}
+try { uWebSocketsExpressCompatibility = require('uwebsockets-express').default; } catch (e) { }
 
 let BunWebSockets: any = undefined;
-try { BunWebSockets = require('@colyseus/bun-websockets'); } catch (e) {}
-
-function getNodeEnv() {
-  return process.env.NODE_ENV || "development";
-}
-
-function getRegion() {
-  // EU, NA, AS, AF, AU, SA, UNKNOWN
-  return (process.env.REGION || "unknown").toLowerCase();
-}
-
-function loadEnvFile(envFileOptions: string[], log: 'none' | 'success' | 'both'  = 'none') {
-    const envPaths = [];
-    envFileOptions.forEach((envFilename) => {
-      envPaths.push(path.resolve(path.dirname(require?.main?.filename || process.cwd()), "..", envFilename));
-      envPaths.push(path.resolve(process.cwd(), envFilename));
-    });
-
-    // return the first .env path found
-    const envPath = envPaths.find((envPath) => fs.existsSync(envPath));
-
-    if (envPath) {
-        dotenv.config({ path: envPath });
-
-        if (log !== "none") {
-            logger.info(`✅ ${path.basename(envPath)} loaded.`);
-        }
-
-    } else if (log === "both") {
-        logger.info(`ℹ️  optional .env file not found: ${envFileOptions.join(", ")}`);
-    }
-}
-
-// load .env.cloud defined on admin panel
-if (process.env.COLYSEUS_CLOUD !== undefined) {
-    loadEnvFile([`.env.cloud`]);
-}
-
-// (overrides previous env configs)
-loadEnvFile([`.env.${getNodeEnv()}`, `.env`], 'both');
-
-if (process.env.REGION !== undefined) {
-  loadEnvFile([`.env.${getRegion()}.${getNodeEnv()}`], 'success');
-}
+try { BunWebSockets = require('@colyseus/bun-websockets'); } catch (e) { }
 
 export interface ConfigOptions {
     options?: ServerOptions,

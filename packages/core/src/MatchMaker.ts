@@ -45,8 +45,32 @@ export let presence: Presence;
 export let driver: MatchMakerDriver;
 export let selectProcessIdToCreateRoom: SelectProcessIdCallback;
 
-export let isGracefullyShuttingDown: boolean;
+/**
+ * Whether health checks are enabled or not. (default: true)
+ *
+ * Health checks are automatically performed on theses scenarios:
+ * - At startup, to check for leftover/invalid processId's
+ * - When a remote room creation request times out
+ * - When a remote seat reservation request times out
+ */
+let enableHealthChecks: boolean = true;
+export function setHealthChecksEnabled(value: boolean) {
+  enableHealthChecks = value;
+}
+
+export let isGracefullyShuttingDown: boolean; // TODO: remove me on 1.0, use 'state' instead
 export let onReady: Deferred = new Deferred(); // onReady needs to be immediately available to @colyseus/auth integration.
+
+export enum MatchMakerState {
+  INITIALIZING,
+  READY,
+  SHUTTING_DOWN
+}
+
+/**
+ * Internal MatchMaker state
+ */
+export let state: MatchMakerState;
 
 /**
  * @private
@@ -65,18 +89,21 @@ export async function setup(
     onReady = new Deferred();
   }
 
+  isGracefullyShuttingDown = false;
+  state = MatchMakerState.INITIALIZING;
+
   presence = _presence || new LocalPresence();
 
   driver = _driver || new LocalDriver();
   publicAddress = _publicAddress;
+
+  stats.reset(false);
 
   // devMode: try to retrieve previous processId
   if (isDevMode) { processId = await getPreviousProcessId(await getHostname()); }
 
   // ensure processId is set
   if (!processId) { processId = generateId(); }
-
-  isGracefullyShuttingDown = false;
 
   /**
    * Define default `assignRoomToProcessId` method.
@@ -117,28 +144,13 @@ export async function accept() {
   /**
    * Check for leftover/invalid processId's on startup
    */
-  const previousStats = await stats.fetchAll();
-  if (previousStats.length > 0) {
-    logger.debug(`${previousStats.length} previous processId(s) found, health-checking...`);
-    await Promise.all(previousStats.map(async (stat) => {
-      try {
-        await requestFromIPC<RoomListingData>(
-          presence,
-          getProcessChannel(stat.processId),
-          'healthcheck',
-          [],
-          REMOTE_ROOM_SHORT_TIMEOUT,
-        );
-        // process succeeded to respond - nothing to do
-      } catch (e) {
-        // process failed to respond - remove it from stats
-        logger.debug(`process ${stat.processId} failed to respond. excluding from stats`);
-        await stats.excludeProcess(stat.processId);
-      }
-    }));
+  if (enableHealthChecks) {
+    await healthCheckAllProcesses();
   }
 
-  await stats.reset();
+  state = MatchMakerState.READY;
+
+  await stats.persist();
 
   if (isDevMode) {
     await reloadFromCache();
@@ -305,6 +317,18 @@ export async function remoteRoomCall<R= any>(
       return await requestFromIPC<R>(presence, getRoomChannel(roomId), method, args, rejectionTimeout);
 
     } catch (e) {
+
+      //
+      // the room cache from an unavailable process might've been used here.
+      // perform a health-check on the process before proceeding.
+      // (this is a broken state when a process wasn't gracefully shut down)
+      //
+      if (method === '_reserveSeat' && e.message === "ipc_timeout") {
+        throw e;
+      }
+
+      // TODO: for 1.0, consider always throwing previous error directly.
+
       const request = `${method}${args && ' with args ' + JSON.stringify(args) || ''}`;
       throw new ServerError(
         ErrorCode.MATCHMAKE_UNHANDLED,
@@ -330,10 +354,10 @@ export function defineRoomType<T extends Type<Room>>(
 
   if (klass.prototype['onAuth'] !== Room.prototype['onAuth']) {
     // TODO: soft-deprecate instance level `onAuth` on 0.16
-    // console.warn("DEPRECATION WARNING: onAuth() at the instance level will be deprecated soon. Please use static onAuth() instead.");
+    // logger.warn("DEPRECATION WARNING: onAuth() at the instance level will be deprecated soon. Please use static onAuth() instead.");
 
     if (klass['onAuth'] !== Room['onAuth']) {
-      console.log(`❌ "${roomName}"'s onAuth() defined at the instance level will be ignored.`);
+      logger.info(`❌ "${roomName}"'s onAuth() defined at the instance level will be ignored.`);
     }
   }
 
@@ -354,7 +378,7 @@ export function removeRoomType(roomName: string) {
 
 // TODO: legacy; remove me on 1.0
 export function hasHandler(roomName: string) {
-  console.warn("hasHandler() is deprecated. Use getHandler() instead.");
+  logger.warn("hasHandler() is deprecated. Use getHandler() instead.");
   return handlers[roomName] !== undefined;
 }
 
@@ -382,10 +406,19 @@ export function getRoomClass(roomName: string): Type<Room> {
  * @returns Promise<RoomListingData> - A promise contaning an object which includes room metadata and configurations.
  */
 export async function createRoom(roomName: string, clientOptions: ClientOptions): Promise<RoomListingData> {
-  const selectedProcessId = await selectProcessIdToCreateRoom(roomName, clientOptions);
+  //
+  // - select a process to create the room
+  // - use local processId if MatchMaker is not ready yet
+  //
+  const selectedProcessId = (state === MatchMakerState.READY)
+    ? await selectProcessIdToCreateRoom(roomName, clientOptions)
+    : processId;
 
   let room: RoomListingData;
-  if (selectedProcessId === processId) {
+  if (selectedProcessId === undefined) {
+    throw new ServerError(ErrorCode.MATCHMAKE_UNHANDLED, `no processId available to create room ${roomName}`);
+
+  } else if (selectedProcessId === processId) {
     // create the room on this process!
     room = await handleCreateRoom(roomName, clientOptions);
 
@@ -409,7 +442,9 @@ export async function createRoom(roomName: string, clientOptions: ClientOptions)
         // when a process disconnects ungracefully, it may leave its previous processId under "roomcount"
         // if the process is still alive, it will re-add itself shortly after the load-balancer selects it again.
         //
-        await stats.excludeProcess(selectedProcessId);
+        if (enableHealthChecks) {
+          await stats.excludeProcess(selectedProcessId);
+        }
 
         // if other process failed to respond, create the room on this process
         room = await handleCreateRoom(roomName, clientOptions);
@@ -521,8 +556,16 @@ export function disconnectAll(closeCode?: number) {
   const promises: Array<Promise<any>> = [];
 
   for (const roomId in rooms) {
-    if (!rooms.hasOwnProperty(roomId)) { continue; }
-    promises.push(rooms[roomId].disconnect(closeCode));
+    if (!rooms.hasOwnProperty(roomId)) {
+      continue;
+    }
+
+    const room = rooms[roomId];
+
+    // prevent touching stats when process is shutting down
+    room._events.removeAllListeners("leave");
+
+    promises.push(room.disconnect(closeCode));
   }
 
   return promises;
@@ -534,6 +577,8 @@ export async function gracefullyShutdown(): Promise<any> {
   }
 
   isGracefullyShuttingDown = true;
+  state = MatchMakerState.SHUTTING_DOWN;
+
   onReady = undefined;
 
   debugMatchMaking(`${processId} is shutting down!`);
@@ -544,6 +589,9 @@ export async function gracefullyShutdown(): Promise<any> {
 
   // remove processId from room count key
   await stats.excludeProcess(processId);
+
+  // remove cached rooms of this process
+  await removeRoomsByProcessId(processId);
 
   // unsubscribe from process id channel
   presence.unsubscribe(getProcessChannel());
@@ -569,11 +617,33 @@ export async function reserveSeatFor(room: RoomListingData, options: ClientOptio
   let successfulSeatReservation: boolean;
 
   try {
-    successfulSeatReservation = await remoteRoomCall(room.roomId, '_reserveSeat', [sessionId, options, authData]);
+    successfulSeatReservation = await remoteRoomCall(
+      room.roomId,
+      '_reserveSeat',
+      [sessionId, options, authData],
+      REMOTE_ROOM_SHORT_TIMEOUT,
+    );
 
   } catch (e) {
     debugMatchMaking(e);
-    successfulSeatReservation = false;
+
+    //
+    // the room cache from an unavailable process might've been used here.
+    // (this is a broken state when a process wasn't gracefully shut down)
+    // perform a health-check on the process before proceeding.
+    //
+    if (
+      e.message === "ipc_timeout" &&
+      !(
+        enableHealthChecks &&
+        await healthCheckProcessId(room.processId)
+      )
+    ) {
+      throw new SeatReservationError(`process ${room.processId} is not available.`);
+
+    } else {
+      successfulSeatReservation = false;
+    }
   }
 
   if (!successfulSeatReservation) {
@@ -596,26 +666,100 @@ function callOnAuth(roomName: string, authOptions?: AuthOptions) {
     : undefined;
 }
 
-async function cleanupStaleRooms(roomName: string) {
+export async function cleanupStaleRooms(roomName: string) {
+  // remove connecting counts
+  await presence.del(getHandlerConcurrencyKey(roomName));
+}
+
+/**
+ * Perform health check on all processes
+ */
+export async function healthCheckAllProcesses() {
+  const allStats = await stats.fetchAll();
+  if (allStats.length > 0) {
+    await Promise.all(
+      allStats
+        .filter(stat => stat.processId !== processId) // skip current process
+        .map(stat => healthCheckProcessId(stat.processId))
+    );
+  }
+}
+
+/**
+ * Perform health check on a remote process
+ * @param processId
+ */
+const _healthCheckByProcessId: { [processId: string]: Promise<any> } = {};
+export function healthCheckProcessId(processId: string) {
+  //
+  // re-use the same promise if health-check is already in progress
+  // (may occur when _reserveSeat() fails multiple times for the same 'processId')
+  //
+  if (_healthCheckByProcessId[processId] !== undefined) {
+    return _healthCheckByProcessId[processId];
+  }
+
+  _healthCheckByProcessId[processId] = new Promise<boolean>(async (resolve, reject) => {
+    logger.debug(`> Performing health-check against processId: '${processId}'...`);
+
+    try {
+      const requestTime = Date.now();
+
+      await requestFromIPC<RoomListingData>(
+        presence,
+        getProcessChannel(processId),
+        'healthcheck',
+        [],
+        REMOTE_ROOM_SHORT_TIMEOUT,
+      );
+
+      logger.debug(`✅ Process '${processId}' successfully responded (${Date.now() - requestTime}ms)`);
+
+      // succeeded to respond
+      resolve(true)
+
+    } catch (e) {
+      // process failed to respond - remove it from stats
+      logger.debug(`❌ Process '${processId}' failed to respond. Cleaning it up.`);
+      const isProcessExcluded = await stats.excludeProcess(processId);
+
+      // clean-up possibly stale room ids
+      if (isProcessExcluded && !isDevMode) {
+        await removeRoomsByProcessId(processId);
+      }
+
+      resolve(false);
+    } finally {
+      delete _healthCheckByProcessId[processId];
+    }
+  });
+
+  return _healthCheckByProcessId[processId];
+}
+
+/**
+ * Remove cached rooms by processId
+ * @param processId
+ */
+async function removeRoomsByProcessId(processId: string) {
   //
   // clean-up possibly stale room ids
   // (ungraceful shutdowns using Redis can result on stale room ids still on memory.)
   //
-  const cachedRooms = await driver.find({ name: roomName }, { _id: 1 });
+  if (typeof(driver.cleanup) === "function") {
+    await driver.cleanup(processId);
 
-  // remove connecting counts
-  await presence.del(getHandlerConcurrencyKey(roomName));
-
-  await Promise.all(cachedRooms.map(async (room) => {
-    try {
-      // use hardcoded short timeout for cleaning up stale rooms.
-      await remoteRoomCall(room.roomId, 'roomId');
-
-    } catch (e) {
-      debugMatchMaking(`cleaning up stale room '${roomName}', roomId: ${room.roomId}`);
-      room.remove();
-    }
-  }));
+  } else {
+    //
+    // TODO: remove this block on 1.0.
+    //
+    //  driver.cleanup() has been added mid-way through 0.15
+    //  some users may still be using older versions of the driver.
+    //
+    const cachedRooms = await driver.find({ processId }, { _id: 1 });
+    logger.debug("> Removing stale rooms by processId:", processId, `(${cachedRooms.length} rooms found)`);
+    cachedRooms.forEach((room) => room.remove());
+  }
 }
 
 async function createRoomReferences(room: Room, init: boolean = false): Promise<boolean> {
@@ -706,6 +850,16 @@ function onVisibilityChange(room: Room, isInvisible: boolean): void {
 
 async function disposeRoom(roomName: string, room: Room) {
   debugMatchMaking('disposing \'%s\' (%s) on processId \'%s\' (graceful shutdown: %s)', roomName, room.roomId, processId, isGracefullyShuttingDown);
+
+  //
+  // FIXME: this call should not be necessary.
+  //
+  // there's an unidentified edge case using LocalDriver where Room._dispose()
+  // doesn't seem to be called [?], but "disposeRoom" is, leaving the matchmaker
+  // in a broken state. (repeated ipc_timeout's for seat reservation on
+  // non-existing rooms)
+  //
+  room.listing.remove();
 
   // decrease amount of rooms this process is handling
   if (!isGracefullyShuttingDown) {

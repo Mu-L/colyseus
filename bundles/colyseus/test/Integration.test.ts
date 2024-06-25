@@ -1,4 +1,5 @@
 import assert from "assert";
+import crypto from "crypto";
 import sinon, { match } from "sinon";
 import * as Colyseus from "colyseus.js";
 import { Schema, type, Context } from "@colyseus/schema";
@@ -31,7 +32,8 @@ describe("Integration", () => {
           presence = new PRESENCE_IMPLEMENTATIONS[i]();
           transport = new WebSocketTransport({
             pingInterval: 100,
-            pingMaxRetries: 3
+            pingMaxRetries: 3,
+            maxPayload: 512,
           });
 
           server = new Server({
@@ -121,6 +123,28 @@ describe("Integration", () => {
               assert.ok(onJoinCalled);
 
               await connection.leave();
+            });
+
+            it("concurrent sync onJoin(), maxClients = 2", async () => {
+              const onJoinHit = new Deferred<string>();
+              matchMaker.defineRoomType("room2_async", class _ extends Room {
+                maxClients = 2;
+                async onJoin() {
+                  onJoinHit.resolve();
+                  await new Promise(resolve => setTimeout(resolve, 100));
+                }
+              });
+
+              const room = await matchMaker.createRoom("room2_async", {});
+
+              client.joinById(room.roomId);
+              await onJoinHit;
+
+              await client.joinById(room.roomId);
+              assert.strictEqual(2, matchMaker.getRoomById(room.roomId).clients.length);
+
+              // disconnect room
+              await matchMaker.getRoomById(room.roomId).disconnect();
             });
 
             it("async onJoin support", async () => {
@@ -850,6 +874,33 @@ describe("Integration", () => {
               assert.ok(!matchMaker.getRoomById(roomId));
             });
 
+            it("second .disconnect() call should return a resolved promise", async () => {
+              let roomId: string;
+              const clients: Client[] = [];
+              matchMaker.defineRoomType('disconnect', class _ extends Room {
+                maxClients = 2;
+                onCreate() { roomId = this.roomId; }
+                onJoin(client) { clients.push(client); }
+                async onLeave() { await timeout(20); }
+              });
+
+              const promises = [
+                client.joinOrCreate('disconnect'),
+                client.joinOrCreate('disconnect'),
+              ];
+
+              await Promise.all(promises);
+
+              const room = matchMaker.getRoomById(roomId);
+              assert.strictEqual(room.roomId, roomId);
+
+              room.disconnect();
+
+              assert.rejects(async () => {
+                await room.disconnect();
+              })
+            });
+
             it("should disconnect all clients", async() => {
               matchMaker.defineRoomType('disconnect', class _ extends Room {
                 maxClients = 2;
@@ -1293,6 +1344,106 @@ describe("Integration", () => {
           });
 
         });
+
+        describe("invalid messages", () => {
+          it("exceeding maxPayload (512) should close the connection", async () => {
+            // no onMessage registered
+            matchMaker.defineRoomType('invalid_messages', class _ extends Room {});
+            const conn1 = await client.joinOrCreate("invalid_messages");
+            conn1.sendBytes("invalid", crypto.randomBytes(2048));
+            await timeout(50);
+            assert.strictEqual(false, conn1.connection.isOpen);
+
+            // 1 onMessage registered
+            matchMaker.defineRoomType('invalid_messages', class _ extends Room {
+              onCreate() {
+                this.onMessage("dummy", () => {})
+              }
+            });
+            const conn2 = await client.joinOrCreate("invalid_messages");
+            conn2.sendBytes("invalid", crypto.randomBytes(2048));
+            await timeout(50);
+            assert.strictEqual(false, conn1.connection.isOpen);
+
+            // wildcard onMessage registered
+            matchMaker.defineRoomType('invalid_messages', class _ extends Room {
+              onCreate() {
+                this.onMessage("*", () => {})
+              }
+            });
+            const conn3 = await client.joinOrCreate("invalid_messages");
+            conn3.sendBytes("invalid", crypto.randomBytes(2048));
+            await timeout(50);
+            assert.strictEqual(false, conn1.connection.isOpen);
+          });
+
+          it("ROOM_DATA: fail to parse should close the connection", async () => {
+            // no onMessage registered
+            matchMaker.defineRoomType('invalid_messages', class _ extends Room {});
+            const conn1 = await client.joinOrCreate("invalid_messages");
+            conn1.connection.send([Protocol.ROOM_DATA, ...crypto.randomBytes(256)]);
+            await timeout(50);
+            assert.strictEqual(false, conn1.connection.isOpen);
+
+            // 1 onMessage registered
+            matchMaker.defineRoomType('invalid_messages', class _ extends Room {
+              onCreate() {
+                this.onMessage("dummy", () => {});
+              }
+            });
+            const conn2 = await client.joinOrCreate("invalid_messages");
+            conn2.connection.send([Protocol.ROOM_DATA, ...crypto.randomBytes(256)]);
+            await timeout(50);
+            assert.strictEqual(false, conn2.connection.isOpen);
+
+            // wildcard onMessage registered
+            matchMaker.defineRoomType('invalid_messages', class _ extends Room {
+              onCreate() {
+                this.onMessage("*", () => {});
+              }
+            });
+            const conn3 = await client.joinOrCreate("invalid_messages");
+            conn3.connection.send([Protocol.ROOM_DATA, ...crypto.randomBytes(256)]);
+            await timeout(50);
+            assert.strictEqual(false, conn3.connection.isOpen);
+          });
+
+          it("ROOM_DATA_BYTES: fail to parse should close the connection", async () => {
+            // no onMessage registered
+            matchMaker.defineRoomType('invalid_messages', class _ extends Room {});
+            const conn1 = await client.joinOrCreate("invalid_messages");
+            conn1.connection.send([Protocol.ROOM_DATA_BYTES, ...crypto.randomBytes(256)]);
+            await timeout(50);
+            assert.strictEqual(false, conn1.connection.isOpen);
+
+            // 1 onMessage registered
+            matchMaker.defineRoomType('invalid_messages', class _ extends Room {
+              onCreate() {
+                this.onMessage('dummy', (_, message) => {});
+              }
+            });
+            const conn2 = await client.joinOrCreate("invalid_messages");
+            conn2.connection.send([Protocol.ROOM_DATA_BYTES, ...crypto.randomBytes(256)]);
+            await timeout(50);
+            assert.strictEqual(false, conn2.connection.isOpen);
+
+            // wildcard onMessage registered
+            const onMessageReceived = new Deferred();
+            matchMaker.defineRoomType('invalid_messages', class _ extends Room {
+              onCreate() {
+                this.onMessage('*', (_, type, message) => {
+                  onMessageReceived.resolve([type, message]);
+                });
+              }
+            });
+            const conn3 = await client.joinOrCreate("invalid_messages");
+            const bytes = crypto.randomBytes(256);
+            conn3.connection.send([Protocol.ROOM_DATA_BYTES, ...bytes]);
+            const [_, message] = await onMessageReceived;
+            assert.ok(Array.from(bytes).toString().includes(Array.from(message).toString()));
+            assert.strictEqual(true, conn3.connection.isOpen);
+          });
+        })
 
       });
 

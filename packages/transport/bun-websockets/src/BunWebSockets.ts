@@ -4,12 +4,12 @@
 // @ts-ignore
 import { ServerWebSocket, WebSocketHandler } from "bun";
 
-import http from 'http';
+import type http from 'http';
 import bunExpress from "bun-serve-express";
 
 import { DummyServer, matchMaker, Transport, debugAndPrintError, spliceOne, ServerError, getBearerToken } from '@colyseus/core';
 import { WebSocketClient, WebSocketWrapper } from './WebSocketClient';
-import { Application, Request, Response } from "express";
+import type { Application, Request, Response } from "express";
 
 export type TransportOptions = Partial<Omit<WebSocketHandler, "message" | "open" | "drain" | "close" | "ping" | "pong">>;
 
@@ -166,7 +166,9 @@ export class BunWebSockets extends Transport {
 
         case 'GET': {
           const matchedParams = req.path.match(matchMaker.controller.allowedRoomNameChars);
-          const roomName = matchedParams.length > 1 ? matchedParams[matchedParams.length - 1] : "";
+          const roomName = (matchedParams && matchedParams.length > 1)
+            ? matchedParams[matchedParams.length - 1]
+            : "";
 
           writeHeaders(req, res);
           res.json(await matchMaker.controller.getAvailableRooms(roomName || ''));
@@ -181,10 +183,16 @@ export class BunWebSockets extends Transport {
 
           const matchedParams = req.path.match(matchMaker.controller.allowedRoomNameChars);
           const matchmakeIndex = matchedParams.indexOf(matchMaker.controller.matchmakeRoute);
-          const clientOptions = req.body; // Bun.readableStreamToJSON(req.body);
+          let clientOptions = req.body; // Bun.readableStreamToJSON(req.body);
 
-          if (clientOptions === undefined) {
+          if (clientOptions == null) {
             throw new ServerError(500, "invalid JSON input");
+          }
+
+          if (typeof clientOptions === 'string' && clientOptions.length > 2) {
+            clientOptions = JSON.parse(clientOptions);
+          } else if (typeof clientOptions !== 'object') {
+            clientOptions = {};
           }
 
           const method = matchedParams[matchmakeIndex + 1];

@@ -115,7 +115,7 @@ export abstract class Room<State extends object= any, Metadata= any> {
 
   // seat reservation & reconnection
   protected seatReservationTime: number = DEFAULT_SEAT_RESERVATION_TIME;
-  protected reservedSeats: { [sessionId: string]: [any, any] } = {};
+  protected reservedSeats: { [sessionId: string]: [any, any, boolean?, boolean?] } = {};
   protected reservedSeatTimeouts: { [sessionId: string]: NodeJS.Timer } = {};
 
   protected _reconnections: { [reconnectionToken: string]: [string, Deferred] } = {};
@@ -142,14 +142,10 @@ export abstract class Room<State extends object= any, Metadata= any> {
   constructor(presence?: Presence) {
     this.presence = presence;
 
-    this._events.once('dispose', async () => {
-      try {
-        await this._dispose();
-
-      } catch (e) {
-        debugAndPrintError(`onDispose error: ${(e && e.message || e || 'promise rejected')}`);
-      }
-      this._events.emit('disconnect');
+    this._events.once('dispose', () => {
+      this._dispose()
+        .catch((e) => debugAndPrintError(`onDispose error: ${(e && e.message || e || 'promise rejected')}`))
+        .finally(() => this._events.emit('disconnect'));
     });
 
     this.setPatchRate(this.patchRate);
@@ -289,31 +285,32 @@ export abstract class Room<State extends object= any, Metadata= any> {
   }
 
   public hasReservedSeat(sessionId: string, reconnectionToken?: string): boolean {
-    if (reconnectionToken) {
-      const reconnection = this._reconnections[reconnectionToken];
+    const reservedSeat = this.reservedSeats[sessionId];
+
+    // seat reservation not found / expired
+    if (reservedSeat === undefined) {
+      return false;
+    }
+
+    if (reservedSeat[3]) {
+      // reconnection
       return (
-        reconnection &&
-        reconnection[0] === sessionId &&
-        this.reservedSeats[sessionId] !== undefined &&
+        reconnectionToken &&
+        this._reconnections[reconnectionToken]?.[0] === sessionId &&
         this._reconnectingSessionId.has(sessionId)
       );
 
     } else {
-      return (
-        this.reservedSeats[sessionId] !== undefined &&
-        (
-          !this._reconnectingSessionId.has(sessionId) || // prevent possible "reconnect" requests without a reconnection token
-          (this._reconnectingSessionId.get(sessionId) === sessionId) // devMode reconnection
-        )
-      );
+      // seat reservation not consumed
+      return reservedSeat[2] === false;
     }
   }
 
   public checkReconnectionToken(reconnectionToken: string) {
-    const reconnection = this._reconnections[reconnectionToken];
-    const sessionId = (reconnection && reconnection[0]);
+    const sessionId = this._reconnections[reconnectionToken]?.[0];
+    const reservedSeat = this.reservedSeats[sessionId];
 
-    if (this.hasReservedSeat(sessionId)) {
+    if (reservedSeat && reservedSeat[3]) {
       this._reconnectingSessionId.set(sessionId, reconnectionToken);
       return sessionId;
 
@@ -526,7 +523,7 @@ export abstract class Room<State extends object= any, Metadata= any> {
   public disconnect(closeCode: number = Protocol.WS_CLOSE_CONSENTED): Promise<any> {
     // skip if already disposing
     if (this._internalState === RoomInternalState.DISPOSING) {
-      return;
+      return Promise.resolve(`disconnect() ignored: room (${this.roomId}) is already disposing.`);
 
     } else if (this._internalState === RoomInternalState.CREATING) {
       throw new Error("cannot disconnect during onCreate()");
@@ -578,7 +575,7 @@ export abstract class Room<State extends object= any, Metadata= any> {
     }
 
     // get seat reservation options and clear it
-    const [joinOptions, authData] = this.reservedSeats[sessionId];
+    const [joinOptions, authData, isConsumed, isWaitingReconnection] = this.reservedSeats[sessionId];
 
     //
     // TODO: remove this check on 1.0.0
@@ -587,10 +584,10 @@ export abstract class Room<State extends object= any, Metadata= any> {
     // - if async onAuth() is in use, the seat reservation is removed after onAuth() is fulfilled.
     // - mark reservation as "consumed"
     //
-    if (this.reservedSeats[sessionId].length > 2) {
+    if (isConsumed) {
       throw new ServerError(ErrorCode.MATCHMAKE_EXPIRED, "already consumed");
     }
-    this.reservedSeats[sessionId].push(true);
+    this.reservedSeats[sessionId][2] = true; // flag seat reservation as "consumed"
 
     // share "after next patch queue" reference with every client.
     client._afterNextPatchQueue = this._afterNextPatchQueue;
@@ -599,10 +596,17 @@ export abstract class Room<State extends object= any, Metadata= any> {
     client.ref['onleave'] = (_) => client.state = ClientState.LEAVING;
     client.ref.once('close', client.ref['onleave']);
 
-    const previousReconnectionToken = this._reconnectingSessionId.get(sessionId);
-    if (previousReconnectionToken) {
-      this.clients.push(client);
-      this._reconnections[previousReconnectionToken]?.[1].resolve(client);
+    if (isWaitingReconnection) {
+      const previousReconnectionToken = this._reconnectingSessionId.get(sessionId);
+      if (previousReconnectionToken) {
+        this.clients.push(client);
+        this._reconnections[previousReconnectionToken]?.[1].resolve(client);
+      } else {
+        const errorMessage = (process.env.NODE_ENV === 'production')
+          ? "already consumed" // trick possible fraudsters...
+          : "bad reconnection token" // ...or developers
+        throw new ServerError(ErrorCode.MATCHMAKE_EXPIRED, errorMessage);
+      }
 
     } else {
       try {
@@ -625,6 +629,15 @@ export abstract class Room<State extends object= any, Metadata= any> {
         }
 
         this.clients.push(client);
+
+        //
+        // Flag sessionId as non-enumarable so hasReachedMaxClients() doesn't count it
+        // (https://github.com/colyseus/colyseus/issues/726)
+        //
+        Object.defineProperty(this.reservedSeats, sessionId, {
+          value: this.reservedSeats[sessionId],
+          enumerable: false,
+        });
 
         if (this.onJoin) {
           await this.onJoin(client, joinOptions, client.auth);
@@ -803,7 +816,7 @@ export abstract class Room<State extends object= any, Metadata= any> {
     }
   }
 
-  private sendFullState(client: Client): void {
+  protected sendFullState(client: Client): void {
     client.enqueueRaw(getMessageBytes[Protocol.ROOM_STATE](this._serializer.getFullState(client)));
   }
 
@@ -840,7 +853,7 @@ export abstract class Room<State extends object= any, Metadata= any> {
       return false;
     }
 
-    this.reservedSeats[sessionId] = [joinOptions, authData];
+    this.reservedSeats[sessionId] = [joinOptions, authData, false, allowReconnection];
 
     if (!allowReconnection) {
       await this._incrementClientCount();
@@ -882,7 +895,7 @@ export abstract class Room<State extends object= any, Metadata= any> {
   private async _dispose(): Promise<any> {
     this._internalState = RoomInternalState.DISPOSING;
 
-    await this.listing.remove();
+    this.listing.remove();
 
     let userReturnData;
     if (this.onDispose) {
@@ -936,6 +949,7 @@ export abstract class Room<State extends object= any, Metadata= any> {
         debugMessage("received: '%s' -> %j", messageType, message);
       } catch (e) {
         debugAndPrintError(e);
+        client.leave(Protocol.WS_CLOSE_WITH_ERROR);
         return;
       }
 
@@ -946,7 +960,17 @@ export abstract class Room<State extends object= any, Metadata= any> {
         (this.onMessageHandlers['*'] as any)(client, messageType, message);
 
       } else {
-        debugAndPrintError(`onMessage for "${messageType}" not registered.`);
+        const errorMessage = `onMessage for "${messageType}" not registered.`;
+        debugAndPrintError(errorMessage);
+
+        if (isDevMode) {
+          // send error code to client in development mode
+          client.error(ErrorCode.INVALID_PAYLOAD, errorMessage);
+
+        } else {
+          // immediately close the connection in production
+          client.leave(Protocol.WS_CLOSE_WITH_ERROR, errorMessage);
+        }
       }
 
     } else if (code === Protocol.ROOM_DATA_BYTES) {
@@ -964,7 +988,17 @@ export abstract class Room<State extends object= any, Metadata= any> {
         (this.onMessageHandlers['*'] as any)(client, messageType, message);
 
       } else {
-        debugAndPrintError(`onMessage for "${messageType}" not registered.`);
+        const errorMessage = `onMessage for "${messageType}" not registered.`;
+        debugAndPrintError(errorMessage);
+
+        if (isDevMode) {
+          // send error code to client in development mode
+          client.error(ErrorCode.INVALID_PAYLOAD, errorMessage);
+
+        } else {
+          // immediately close the connection in production
+          client.leave(Protocol.WS_CLOSE_WITH_ERROR, errorMessage);
+        }
       }
 
     } else if (code === Protocol.JOIN_ROOM && client.state === ClientState.JOINING) {
