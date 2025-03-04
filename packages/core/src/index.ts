@@ -17,7 +17,7 @@ export {
   OnMessageException,
   SimulationIntervalException,
   TimedEventException,
-} from './errors/RoomExceptions';
+} from './errors/RoomExceptions.js';
 
 // MatchMaker
 import * as matchMaker from './MatchMaker.js';
@@ -57,7 +57,7 @@ export {
   debugDriver,
   debugPresence,
   debugAndPrintError,
-} from './Debug';
+} from './Debug.js';
 
 // Default rooms
 export { LobbyRoom } from './rooms/LobbyRoom.js';

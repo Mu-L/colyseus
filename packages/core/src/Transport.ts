@@ -20,13 +20,16 @@ export type AuthContext = {
   token?: string,
   headers: http.IncomingHttpHeaders,
   ip: string | string[];
+  // FIXME: each transport may have its own specific properties.
+  // "req" only applies to WebSocketTransport.
+  req?: http.IncomingMessage;
 };
 
 export interface ISendOptions {
   afterNextPatch?: boolean;
 }
 
-export enum ClientState { JOINING, JOINED, RECONNECTED, LEAVING }
+export enum ClientState { JOINING, JOINED, RECONNECTED, LEAVING, CLOSED }
 
 /**
  * The client instance from the server-side is responsible for the transport layer between the server and the client.

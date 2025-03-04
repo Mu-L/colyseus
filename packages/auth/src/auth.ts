@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import express, { Router } from 'express';
 import { existsSync } from 'fs';
 import { generateId, logger, matchMaker } from '@colyseus/core';
@@ -51,9 +52,12 @@ let onHashPassword: HashPasswordCallback = async (password: string) => Hash.make
 /**
  * Detect HTML template path (for password reset form)
  */
+// __dirname is not available in ESM
+const getDirname = () => (typeof __dirname !== 'undefined') ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+
 const htmlTemplatePath = [
   path.join(process.cwd(), "html"),
-  path.join(__dirname, "..", "html"),
+  path.join(getDirname(), "..", "html"),
 ].find((filePath) => existsSync(filePath));
 
 const RESET_PASSWORD_TOKEN_EXPIRATION_MINUTES = 30;
